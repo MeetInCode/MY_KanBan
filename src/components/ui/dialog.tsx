@@ -35,7 +35,7 @@ export function DialogTrigger({ asChild, children }: { asChild?: boolean; childr
   const child = React.Children.only(children);
   const props = {
     onClick: (e: React.MouseEvent) => {
-      child.props.onClick?.(e);
+      (child.props as any).onClick?.(e);
       ctx.setOpen(true);
     },
   } as React.HTMLAttributes<HTMLElement>;
@@ -80,7 +80,7 @@ export function DialogClose({ asChild, children }: { asChild?: boolean; children
   const child = React.Children.only(children);
   const props = {
     onClick: (e: React.MouseEvent) => {
-      child.props.onClick?.(e);
+      (child.props as any).onClick?.(e);
       ctx.setOpen(false);
     },
   } as React.HTMLAttributes<HTMLElement>;
