@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Pencil, Trash2, Plus } from "lucide-react";
+import { Pencil, Trash2, Plus, RefreshCw } from "lucide-react";
 import { supabase } from "@/lib/supabaseClient";
 
 type TodoItem = {
@@ -20,6 +20,7 @@ type TodoItem = {
   updated_at: string;
 };
 
+
 export default function MobileTodoList() {
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [addOpen, setAddOpen] = useState(false);
@@ -27,15 +28,81 @@ export default function MobileTodoList() {
   const [newDesc, setNewDesc] = useState("");
   const [newLinks, setNewLinks] = useState("");
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
 
-  // Fetch todos from Supabase
+  // Fetch todos from Supabase and set up real-time subscription
   useEffect(() => {
     fetchTodos();
+
+    // Set up real-time subscription for kanban_cards table
+    const subscription = supabase
+      .channel('kanban_cards_changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'kanban_cards'
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (payload: any) => {
+          console.log('Real-time update received:', payload);
+          
+          switch (payload.eventType) {
+            case 'INSERT':
+              console.log('INSERT event:', payload.new);
+              if (payload.new) {
+                setTodos(prev => [payload.new as TodoItem, ...prev]);
+              }
+              break;
+            case 'UPDATE':
+              console.log('UPDATE event:', payload.new);
+              if (payload.new) {
+                setTodos(prev => 
+                  prev.map(todo => 
+                    todo.id === payload.new.id ? payload.new as TodoItem : todo
+                  )
+                );
+              }
+              break;
+            case 'DELETE':
+              console.log('DELETE event:', payload.old);
+              if (payload.old) {
+                setTodos(prev => 
+                  prev.filter(todo => todo.id !== payload.old.id)
+                );
+              }
+              break;
+            default:
+              console.log('Unknown event type:', payload.eventType);
+          }
+        }
+      )
+      .subscribe((status) => {
+        console.log('Subscription status:', status);
+        if (status === 'SUBSCRIBED') {
+          setConnectionStatus('connected');
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          setConnectionStatus('disconnected');
+        }
+      });
+
+    // Cleanup subscription on unmount
+    return () => {
+      subscription.unsubscribe();
+    };
   }, []);
 
-  const fetchTodos = async () => {
+  const fetchTodos = async (isRefresh = false) => {
     try {
-      setLoading(true);
+      if (isRefresh) {
+        setIsRefreshing(true);
+      } else {
+        setLoading(true);
+      }
+      setError(null);
       const { data, error } = await supabase
         .from("kanban_cards")
         .select("*")
@@ -43,14 +110,17 @@ export default function MobileTodoList() {
 
       if (error) {
         console.error("Error fetching todos:", error);
+        setError("Failed to load tasks. Please try again.");
         return;
       }
 
       setTodos(data || []);
     } catch (error) {
       console.error("Error fetching todos:", error);
+      setError("Failed to load tasks. Please check your connection.");
     } finally {
       setLoading(false);
+      setIsRefreshing(false);
     }
   };
 
@@ -60,29 +130,39 @@ export default function MobileTodoList() {
     if (!newTitle.trim()) return;
 
     try {
+      setError(null);
+      console.log("Adding new todo:", { newTitle, newDesc, newLinks });
+      
       const links = newLinks
         .split(',')
         .map(s => s.trim())
         .filter(Boolean)
         .map((href, i) => ({ label: `Link ${i + 1}`, href }));
 
+      const insertData = {
+        title: newTitle,
+        description: newDesc || null,
+        links: links.length ? links : null,
+        column_key: "todo",
+        position: 0,
+      };
+      
+      console.log("Inserting data:", insertData);
+
       const { data, error } = await supabase
         .from("kanban_cards")
-        .insert({
-          title: newTitle,
-          description: newDesc || null,
-          links: links.length ? links : null,
-          column_key: "todo",
-          position: 0,
-        })
+        .insert(insertData)
         .select()
         .single();
 
       if (error) {
         console.error("Error adding todo:", error);
+        setError(`Failed to add task: ${error.message}`);
         return;
       }
 
+      console.log("Successfully added todo:", data);
+      // Update local state immediately for better UX
       setTodos(prev => [data, ...prev]);
       setNewTitle("");
       setNewDesc("");
@@ -90,11 +170,15 @@ export default function MobileTodoList() {
       setAddOpen(false);
     } catch (error) {
       console.error("Error adding todo:", error);
+      setError("Failed to add task. Please check your connection.");
     }
   };
 
   const handleDeleteTodo = async (id: string) => {
     try {
+      setError(null);
+      console.log("Deleting todo with id:", id);
+      
       const { error } = await supabase
         .from("kanban_cards")
         .delete()
@@ -102,37 +186,56 @@ export default function MobileTodoList() {
 
       if (error) {
         console.error("Error deleting todo:", error);
-        return;
+        setError(`Failed to delete task: ${error.message}`);
+        throw error; // Throw error so the calling function knows it failed
       }
 
+      console.log("Successfully deleted todo with id:", id);
+      // Update local state immediately for better UX
       setTodos(prev => prev.filter(todo => todo.id !== id));
+      // Return success indicator (void for consistency)
     } catch (error) {
       console.error("Error deleting todo:", error);
+      setError("Failed to delete task. Please check your connection.");
+      throw error; // Re-throw so the calling function knows it failed
     }
   };
 
   const handleEditTodo = async (id: string, updatedData: Partial<TodoItem>) => {
     try {
+      setError(null);
+      console.log("Updating todo with id:", id, "data:", updatedData);
+      
+      const updateData = {
+        title: updatedData.title,
+        description: updatedData.description,
+        links: updatedData.links,
+        updated_at: new Date().toISOString(),
+      };
+      
+      console.log("Update data:", updateData);
+
       const { data, error } = await supabase
         .from("kanban_cards")
-        .update({
-          title: updatedData.title,
-          description: updatedData.description,
-          links: updatedData.links,
-          updated_at: new Date().toISOString(),
-        })
+        .update(updateData)
         .eq("id", id)
         .select()
         .single();
 
       if (error) {
         console.error("Error updating todo:", error);
-        return;
+        setError(`Failed to update task: ${error.message}`);
+        throw error; // Throw error so the calling function knows it failed
       }
 
+      console.log("Successfully updated todo:", data);
+      // Update local state immediately for better UX
       setTodos(prev => prev.map(todo => todo.id === id ? data : todo));
+      return data; // Return the updated data
     } catch (error) {
       console.error("Error updating todo:", error);
+      setError("Failed to update task. Please check your connection.");
+      throw error; // Re-throw so the calling function knows it failed
     }
   };
 
@@ -141,7 +244,7 @@ export default function MobileTodoList() {
       <div className="min-h-screen bg-white flex items-center justify-center">
         <div className="text-center">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 mx-auto mb-4"></div>
-          <p className="text-gray-600">Loading todos...</p>
+          <p className="text-gray-600">Loading tasks...</p>
         </div>
       </div>
     );
@@ -157,6 +260,36 @@ export default function MobileTodoList() {
             <p className="text-gray-600 text-sm mt-1">
               {todos.length} {todos.length === 1 ? 'task' : 'tasks'}
             </p>
+            <div className="flex items-center gap-2 mt-2">
+              <button
+                onClick={() => fetchTodos(true)}
+                disabled={isRefreshing}
+                className="text-gray-500 hover:text-gray-700 text-xs flex items-center gap-1"
+              >
+                <RefreshCw className={`h-3 w-3 ${isRefreshing ? 'animate-spin' : ''}`} />
+                {isRefreshing ? 'Refreshing...' : 'Refresh'}
+              </button>
+              <span className={`text-xs ${
+                connectionStatus === 'connected' ? 'text-green-600' : 
+                connectionStatus === 'connecting' ? 'text-yellow-600' : 
+                'text-red-600'
+              }`}>
+                ● {connectionStatus === 'connected' ? 'Live' : 
+                   connectionStatus === 'connecting' ? 'Connecting...' : 
+                   'Offline'}
+              </span>
+            </div>
+            {error && (
+              <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded-md">
+                <p className="text-red-600 text-xs">{error}</p>
+                <button 
+                  onClick={() => setError(null)}
+                  className="text-red-500 text-xs underline mt-1"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
           </div>
           <Dialog open={addOpen} onOpenChange={setAddOpen}>
             <DialogTrigger asChild>
@@ -255,8 +388,8 @@ function TodoCard({
   onEdit 
 }: { 
   todo: TodoItem; 
-  onDelete: (id: string) => void; 
-  onEdit: (id: string, data: Partial<TodoItem>) => void;
+  onDelete: (id: string) => Promise<void>; 
+  onEdit: (id: string, data: Partial<TodoItem>) => Promise<TodoItem>;
 }) {
   const [editOpen, setEditOpen] = useState(false);
   const [editTitle, setEditTitle] = useState(todo.title);
@@ -264,21 +397,38 @@ function TodoCard({
   const [editLinks, setEditLinks] = useState(
     (todo.links || []).map(l => l.href).join(", ")
   );
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
 
-  const handleSave = (e: React.FormEvent) => {
+  const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    const links = editLinks
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean)
-      .map((href, i) => ({ label: `Link ${i + 1}`, href }));
+    setIsEditing(true);
+    
+    try {
+      const links = editLinks
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map((href, i) => ({ label: `Link ${i + 1}`, href }));
 
-    onEdit(todo.id, {
-      title: editTitle,
-      description: editDesc || undefined,
-      links: links.length ? links : undefined,
-    });
-    setEditOpen(false);
+      await onEdit(todo.id, {
+        title: editTitle,
+        description: editDesc || undefined,
+        links: links.length ? links : undefined,
+      });
+      setEditOpen(false);
+    } finally {
+      setIsEditing(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    setIsDeleting(true);
+    try {
+      await onDelete(todo.id);
+    } finally {
+      setIsDeleting(false);
+    }
   };
 
   return (
@@ -334,8 +484,19 @@ function TodoCard({
                     <DialogClose asChild>
                       <Button type="button" variant="outline">Cancel</Button>
                     </DialogClose>
-                    <Button type="submit" className="bg-blue-600 hover:bg-blue-700">
-                      Save Changes
+                    <Button 
+                      type="submit" 
+                      className="bg-blue-600 hover:bg-blue-700"
+                      disabled={isEditing}
+                    >
+                      {isEditing ? (
+                        <>
+                          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                          Saving...
+                        </>
+                      ) : (
+                        'Save Changes'
+                      )}
                     </Button>
                   </DialogFooter>
                 </form>
@@ -345,9 +506,14 @@ function TodoCard({
               size="sm" 
               variant="outline" 
               className="h-8 w-8 p-0 text-red-600 hover:text-red-700 hover:bg-red-50"
-              onClick={() => onDelete(todo.id)}
+              onClick={handleDelete}
+              disabled={isDeleting}
             >
-              <Trash2 className="h-4 w-4" />
+              {isDeleting ? (
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-red-600"></div>
+              ) : (
+                <Trash2 className="h-4 w-4" />
+              )}
             </Button>
           </div>
         </div>

@@ -77,49 +77,195 @@ export default function KanbanBoard() {
   const [newLinks, setNewLinks] = React.useState("");
   const [newColumn, setNewColumn] = React.useState<ColumnKey>("todo");
   const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = React.useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const loadingRef = React.useRef(false);
+  const localUpdateRef = React.useRef<Set<string>>(new Set());
+
+  // Helper function to ensure no duplicate items across columns
+  const ensureUniqueItems = React.useCallback((boardState: BoardState): BoardState => {
+    const seenIds = new Set<string>();
+    const cleanBoard: BoardState = { todo: [], doing: [], done: [], temp: [] };
+    
+    for (const [colKey, items] of Object.entries(boardState) as [ColumnKey, KanbanItem[]][]) {
+      cleanBoard[colKey] = items.filter(item => {
+        if (seenIds.has(item.id)) {
+          console.warn(`Duplicate item found: ${item.id} in column ${colKey}`);
+          return false;
+        }
+        seenIds.add(item.id);
+        return true;
+      });
+    }
+    
+    return cleanBoard;
+  }, []);
 
   React.useEffect(() => {
     if (loadingRef.current) return;
     loadingRef.current = true;
-    (async () => {
-      const { data: columns } = await supabase
-        .from("kanban_columns")
-        .select("key, title, position")
-        .order("position", { ascending: true });
+    
+    const fetchData = async () => {
+      try {
+        setError(null);
+        const { data: columns } = await supabase
+          .from("kanban_columns")
+          .select("key, title, position")
+          .order("position", { ascending: true });
 
-      const { data: cards } = await supabase
-        .from("kanban_cards")
-        .select("id, title, description, links, column_key, position")
-        .order("position", { ascending: true });
+        const { data: cards } = await supabase
+          .from("kanban_cards")
+          .select("id, title, description, links, column_key, position")
+          .order("position", { ascending: true });
 
-      const next: BoardState = { todo: [], doing: [], done: [], temp: [] };
-      for (const col of columns || []) {
-        const colKey = col.key as ColumnKey;
-        next[colKey] = [];
+        const next: BoardState = { todo: [], doing: [], done: [], temp: [] };
+        for (const col of columns || []) {
+          const colKey = col.key as ColumnKey;
+          next[colKey] = [];
+        }
+        for (const c of cards || []) {
+          const colKey = (c.column_key as ColumnKey) ?? "todo";
+          const links = Array.isArray(c.links)
+            ? (c.links as { label?: string; href: string }[]).map((l, i) => ({
+                label: l.label ?? `Link ${i + 1}`,
+                href: l.href,
+              }))
+            : undefined;
+          next[colKey] = [
+            ...next[colKey],
+            { id: String(c.id), title: c.title, description: c.description ?? undefined, links },
+          ];
+        }
+        setBoard(ensureUniqueItems(next));
+        setLoading(false);
+      } catch (error) {
+        console.error("Error fetching data:", error);
+        setError("Failed to load board data. Please refresh the page.");
+        setLoading(false);
       }
-      for (const c of cards || []) {
-        const colKey = (c.column_key as ColumnKey) ?? "todo";
-        const links = Array.isArray(c.links)
-          ? (c.links as { label?: string; href: string }[]).map((l, i) => ({
-              label: l.label ?? `Link ${i + 1}`,
-              href: l.href,
-            }))
-          : undefined;
-        next[colKey] = [
-          ...next[colKey],
-          { id: String(c.id), title: c.title, description: c.description ?? undefined, links },
-        ];
-      }
-      setBoard(next);
-    })();
-  }, []);
+    };
+
+    fetchData();
+
+    // Set up real-time subscription for kanban_cards table
+    const subscription = supabase
+      .channel('kanban_cards_changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'kanban_cards'
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (payload: any) => {
+          console.log('Real-time update received:', payload);
+          
+          switch (payload.eventType) {
+            case 'INSERT':
+              console.log('INSERT event:', payload.new);
+              if (payload.new) {
+                const newCard = payload.new;
+                const colKey = (newCard.column_key as ColumnKey) ?? "todo";
+                const links = Array.isArray(newCard.links)
+                  ? (newCard.links as { label?: string; href: string }[]).map((l, i) => ({
+                      label: l.label ?? `Link ${i + 1}`,
+                      href: l.href,
+                    }))
+                  : undefined;
+                const newItem: KanbanItem = {
+                  id: String(newCard.id),
+                  title: newCard.title,
+                  description: newCard.description ?? undefined,
+                  links,
+                };
+                setBoard(prev => ensureUniqueItems({
+                  ...prev,
+                  [colKey]: [newItem, ...prev[colKey]]
+                }));
+              }
+              break;
+            case 'UPDATE':
+              console.log('UPDATE event:', payload.new);
+              if (payload.new) {
+                const updatedCard = payload.new;
+                const cardId = String(updatedCard.id);
+                
+                // Skip real-time updates for items we're currently updating locally
+                if (localUpdateRef.current.has(cardId)) {
+                  console.log(`Skipping real-time update for ${cardId} - local update in progress`);
+                  return;
+                }
+                
+                const newColKey = (updatedCard.column_key as ColumnKey) ?? "todo";
+                const links = Array.isArray(updatedCard.links)
+                  ? (updatedCard.links as { label?: string; href: string }[]).map((l, i) => ({
+                      label: l.label ?? `Link ${i + 1}`,
+                      href: l.href,
+                    }))
+                  : undefined;
+                const updatedItem: KanbanItem = {
+                  id: cardId,
+                  title: updatedCard.title,
+                  description: updatedCard.description ?? undefined,
+                  links,
+                };
+                setBoard(prev => {
+                  const newBoard = { ...prev };
+                  
+                  // Remove the item from all columns first
+                  for (const colKey of Object.keys(newBoard) as ColumnKey[]) {
+                    newBoard[colKey] = newBoard[colKey].filter(item => item.id !== cardId);
+                  }
+                  
+                  // Add the updated item to the correct column
+                  newBoard[newColKey] = [...newBoard[newColKey], updatedItem];
+                  
+                  return ensureUniqueItems(newBoard);
+                });
+              }
+              break;
+            case 'DELETE':
+              console.log('DELETE event:', payload.old);
+              if (payload.old) {
+                const deletedCard = payload.old;
+                setBoard(prev => {
+                  const newBoard = { ...prev };
+                  for (const colKey of Object.keys(newBoard) as ColumnKey[]) {
+                    newBoard[colKey] = newBoard[colKey].filter(item => item.id !== String(deletedCard.id));
+                  }
+                  return ensureUniqueItems(newBoard);
+                });
+              }
+              break;
+            default:
+              console.log('Unknown event type:', payload.eventType);
+          }
+        }
+      )
+      .subscribe((status) => {
+        console.log('Subscription status:', status);
+        if (status === 'SUBSCRIBED') {
+          setConnectionStatus('connected');
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          setConnectionStatus('disconnected');
+        }
+      });
+
+    // Cleanup subscription on unmount
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [ensureUniqueItems]);
 
   // Configure sensors for better drag detection
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: {
-        distance: 4, // start faster
+        distance: 8, // Slightly more distance to prevent accidental drags
+        delay: 100, // Small delay for better UX
+        tolerance: 5, // Tolerance for movement
       },
     })
   );
@@ -196,7 +342,7 @@ export default function KanbanBoard() {
     }
     
     if (activeContainer === overContainer) {
-      // Same container sorting
+      // Same container sorting - keep local for speed
       const activeIndex = board[activeContainer].findIndex((item) => item.id === activeId);
       const overIndex = board[overContainer].findIndex((item) => item.id === overId);
       
@@ -205,17 +351,26 @@ export default function KanbanBoard() {
           ...prev,
           [overContainer]: arrayMove(prev[overContainer], activeIndex, overIndex),
         }));
-        // Persist order for this column
+        // Persist order for this column in background
         void persistColumnPositions(overContainer);
       }
     } else {
-      // Moved across columns, persist column for the card and positions for both columns
-      void updateCardColumn(activeId, overContainer).then(() => {
-        void Promise.all([
-          persistColumnPositions(activeContainer),
-          persistColumnPositions(overContainer),
-        ]);
-      });
+      // Moved across columns - update immediately for better UX
+      const activeItem = board[activeContainer].find(item => item.id === activeId);
+      if (activeItem) {
+        // Update local state immediately
+        setBoard((prev) => {
+          const newBoard = { ...prev };
+          // Remove from source column
+          newBoard[activeContainer] = newBoard[activeContainer].filter(item => item.id !== activeId);
+          // Add to target column
+          newBoard[overContainer] = [...newBoard[overContainer], activeItem];
+          return ensureUniqueItems(newBoard);
+        });
+        
+        // Update Supabase in background
+        void updateCardColumnAndPositions(activeId, overContainer, activeContainer);
+      }
     }
     
     setActiveId(null);
@@ -267,7 +422,7 @@ export default function KanbanBoard() {
               }))
             : undefined,
         };
-        setBoard(prev => ({ ...prev, [newColumn]: [newItem, ...prev[newColumn]] }));
+        setBoard(prev => ensureUniqueItems({ ...prev, [newColumn]: [newItem, ...prev[newColumn]] }));
         // Recompute positions after unshift
         void persistColumnPositions(newColumn);
         setAddOpen(false);
@@ -276,22 +431,70 @@ export default function KanbanBoard() {
     })();
   }
 
-  function handleDelete(col: ColumnKey, id: string) {
-    setBoard(prev => ({ ...prev, [col]: prev[col].filter(i => i.id !== id) }));
-    void supabase.from("kanban_cards").delete().eq("id", id);
-    void persistColumnPositions(col);
+  async function handleDelete(col: ColumnKey, id: string) {
+    try {
+      setError(null);
+      console.log("Deleting card with id:", id);
+      
+      const { error } = await supabase
+        .from("kanban_cards")
+        .delete()
+        .eq("id", id);
+
+      if (error) {
+        console.error("Error deleting card:", error);
+        setError(`Failed to delete task: ${error.message}`);
+        return;
+      }
+
+      console.log("Successfully deleted card with id:", id);
+      // Update local state immediately for better UX
+      setBoard(prev => ensureUniqueItems({ ...prev, [col]: prev[col].filter(i => i.id !== id) }));
+      await persistColumnPositions(col);
+    } catch (error) {
+      console.error("Error deleting card:", error);
+      setError("Failed to delete task. Please check your connection.");
+    }
   }
 
-  function handleEdit(col: ColumnKey, updated: KanbanItem) {
-    setBoard(prev => ({
-      ...prev,
-      [col]: prev[col].map(i => (i.id === updated.id ? { ...i, ...updated } : i)),
-    }));
-    const links = (updated.links || []).map((l, i) => ({ label: l.label ?? `Link ${i + 1}`, href: l.href }));
-    void supabase
-      .from("kanban_cards")
-      .update({ title: updated.title, description: updated.description ?? null, links: links.length ? links : null })
-      .eq("id", updated.id);
+  async function handleEdit(col: ColumnKey, updated: KanbanItem) {
+    try {
+      setError(null);
+      console.log("Updating card with id:", updated.id, "data:", updated);
+      
+      const links = (updated.links || []).map((l, i) => ({ label: l.label ?? `Link ${i + 1}`, href: l.href }));
+      const updateData = {
+        title: updated.title,
+        description: updated.description ?? null,
+        links: links.length ? links : null,
+        updated_at: new Date().toISOString(),
+      };
+      
+      console.log("Update data:", updateData);
+
+      const { data, error } = await supabase
+        .from("kanban_cards")
+        .update(updateData)
+        .eq("id", updated.id)
+        .select()
+        .single();
+
+      if (error) {
+        console.error("Error updating card:", error);
+        setError(`Failed to update task: ${error.message}`);
+        return;
+      }
+
+      console.log("Successfully updated card:", data);
+      // Update local state immediately for better UX
+      setBoard(prev => ensureUniqueItems({
+        ...prev,
+        [col]: prev[col].map(i => (i.id === updated.id ? { ...i, ...updated } : i)),
+      }));
+    } catch (error) {
+      console.error("Error updating card:", error);
+      setError("Failed to update task. Please check your connection.");
+    }
   }
 
   const activeItem = activeId ? findActiveItem(activeId) : null;
@@ -305,16 +508,79 @@ export default function KanbanBoard() {
   }
 
   async function persistColumnPositions(col: ColumnKey) {
-    const items = board[col];
-    // Re-read latest to avoid stale closure
-    const current = items.map((it, idx) => ({ id: it.id, position: idx }));
-    for (const row of current) {
-      await supabase.from("kanban_cards").update({ position: row.position }).eq("id", row.id);
+    try {
+      const items = board[col];
+      if (items.length === 0) return;
+      
+      // Re-read latest to avoid stale closure
+      const current = items.map((it, idx) => ({ id: it.id, position: idx }));
+      
+      // Update all positions in parallel for better performance
+      const updatePromises = current.map(row => 
+        supabase.from("kanban_cards").update({ position: row.position }).eq("id", row.id)
+      );
+      
+      await Promise.all(updatePromises);
+      console.log(`Updated positions for ${current.length} items in column ${col}`);
+    } catch (error) {
+      console.error(`Error updating positions for column ${col}:`, error);
     }
   }
 
-  async function updateCardColumn(cardId: string, newCol: ColumnKey) {
-    await supabase.from("kanban_cards").update({ column_key: newCol }).eq("id", cardId);
+
+  async function updateCardColumnAndPositions(cardId: string, newCol: ColumnKey, oldCol: ColumnKey) {
+    try {
+      console.log(`Moving card ${cardId} from ${oldCol} to ${newCol}`);
+      
+      // Mark this card as being updated locally to prevent real-time conflicts
+      localUpdateRef.current.add(cardId);
+      
+      // Update the card's column
+      const { error: columnError } = await supabase
+        .from("kanban_cards")
+        .update({ 
+          column_key: newCol,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", cardId);
+
+      if (columnError) {
+        console.error("Error updating card column:", columnError);
+        setError(`Failed to move task: ${columnError.message}`);
+        localUpdateRef.current.delete(cardId);
+        return;
+      }
+
+      // Update positions for both columns in parallel
+      await Promise.all([
+        persistColumnPositions(newCol),
+        persistColumnPositions(oldCol),
+      ]);
+
+      console.log(`Successfully moved card ${cardId} from ${oldCol} to ${newCol}`);
+      
+      // Remove from local update tracking after a short delay
+      setTimeout(() => {
+        localUpdateRef.current.delete(cardId);
+      }, 1000);
+    } catch (error) {
+      console.error("Error updating card column and positions:", error);
+      setError("Failed to move task. Please check your connection.");
+      localUpdateRef.current.delete(cardId);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="w-full max-w-[1400px] mx-auto px-3">
+        <div className="flex items-center justify-center min-h-[400px]">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white mx-auto mb-4"></div>
+            <p className="text-white/80">Loading board...</p>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -323,6 +589,28 @@ export default function KanbanBoard() {
         <div>
           <h2 className="text-3xl font-bold text-white drop-shadow mb-2">Kanban Board</h2>
           <p className="text-white/80 text-sm">~ &ldquo;The secret of getting ahead is getting started.&rdquo;</p>
+          <div className="flex items-center gap-2 mt-2">
+            <span className={`text-xs ${
+              connectionStatus === 'connected' ? 'text-green-400' : 
+              connectionStatus === 'connecting' ? 'text-yellow-400' : 
+              'text-red-400'
+            }`}>
+              ● {connectionStatus === 'connected' ? 'Live' : 
+                 connectionStatus === 'connecting' ? 'Connecting...' : 
+                 'Offline'}
+            </span>
+          </div>
+          {error && (
+            <div className="mt-2 p-2 bg-red-900/20 border border-red-500/30 rounded-md">
+              <p className="text-red-300 text-xs">{error}</p>
+              <button 
+                onClick={() => setError(null)}
+                className="text-red-400 text-xs underline mt-1"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
         </div>
         <Dialog open={addOpen} onOpenChange={setAddOpen}>
           <DialogTrigger asChild>
@@ -390,12 +678,12 @@ export default function KanbanBoard() {
         
         <DragOverlay>
           {activeItem ? (
-            <div className="transform rotate-3 scale-105 shadow-2xl">
+            <div className="transform rotate-2 scale-110 shadow-2xl opacity-90">
               <KanbanCard
                 item={activeItem}
                 dragging={true}
-                onDelete={() => {}}
-                onEdit={() => {}}
+                onDelete={async () => {}}
+                onEdit={async () => {}}
                 isOverlay
               />
             </div>
@@ -406,7 +694,7 @@ export default function KanbanBoard() {
   );
 }
 
-function Column({ colKey, items, onDelete, onEdit }: { colKey: ColumnKey; items: KanbanItem[]; onDelete: (c: ColumnKey, id: string) => void; onEdit: (c: ColumnKey, item: KanbanItem) => void; }) {
+function Column({ colKey, items, onDelete, onEdit }: { colKey: ColumnKey; items: KanbanItem[]; onDelete: (c: ColumnKey, id: string) => Promise<void>; onEdit: (c: ColumnKey, item: KanbanItem) => Promise<void>; }) {
   const meta = columnMeta[colKey];
   const { setNodeRef, isOver } = useDroppable({ id: colKey });
   
@@ -421,18 +709,18 @@ function Column({ colKey, items, onDelete, onEdit }: { colKey: ColumnKey; items:
         </div>
       </div>
       
-      <div ref={setNodeRef} className={`space-y-3 min-h-[160px] p-2 rounded-lg transition-colors ${isOver ? 'bg-white/60' : ''}`}>
+      <div ref={setNodeRef} className={`space-y-3 min-h-[160px] p-2 rounded-lg transition-all duration-200 ${isOver ? 'bg-white/60 ring-2 ring-blue-300 scale-[1.02]' : 'bg-transparent'}`}>
         <SortableContext id={colKey} items={items.map(item => item.id)} strategy={verticalListSortingStrategy}>
-          {items.map((item) => (
+          {items.map((item, index) => (
             <SortableKanbanCard
-              key={item.id}
+              key={`${colKey}-${item.id}-${index}`}
               item={item}
-              onDelete={() => onDelete(colKey, item.id)}
-              onEdit={(upd) => onEdit(colKey, upd)}
+              onDelete={async () => await onDelete(colKey, item.id)}
+              onEdit={async (upd) => await onEdit(colKey, upd)}
             />
           ))}
           {items.length === 0 && (
-            <div className="h-16 rounded-md border border-dashed border-neutral-300 bg-white/50 flex items-center justify-center text-xs text-neutral-500">
+            <div className="h-16 rounded-md border border-dashed border-neutral-300 bg-white/50 flex items-center justify-center text-xs text-neutral-500 transition-all duration-200 hover:border-blue-400 hover:bg-blue-50/50">
               Drop here
             </div>
           )}
@@ -442,7 +730,7 @@ function Column({ colKey, items, onDelete, onEdit }: { colKey: ColumnKey; items:
   );
 }
 
-function SortableKanbanCard({ item, onDelete, onEdit }: { item: KanbanItem; onDelete: () => void; onEdit: (item: KanbanItem) => void; }) {
+function SortableKanbanCard({ item, onDelete, onEdit }: { item: KanbanItem; onDelete: () => Promise<void>; onEdit: (item: KanbanItem) => Promise<void>; }) {
   const {
     attributes,
     listeners,
@@ -463,7 +751,7 @@ function SortableKanbanCard({ item, onDelete, onEdit }: { item: KanbanItem; onDe
     <div
       ref={setNodeRef}
       style={style}
-      className={`${isDragging ? 'opacity-50' : 'opacity-100'}`}
+      className={`${isDragging ? 'opacity-50 scale-105' : 'opacity-100'} transition-all duration-200`}
     >
       <KanbanCard
         item={item}
@@ -486,31 +774,61 @@ function KanbanCard({
 }: { 
   item: KanbanItem; 
   dragging: boolean; 
-  onDelete: () => void; 
-  onEdit: (item: KanbanItem) => void; 
+  onDelete: () => Promise<void>; 
+  onEdit: (item: KanbanItem) => Promise<void>; 
   dragHandleProps?: { attributes: DraggableAttributes; listeners?: React.DOMAttributes<Element> };
   isOverlay?: boolean;
 }) {
   const [editTitle, setEditTitle] = React.useState(item.title);
   const [editDesc, setEditDesc] = React.useState(item.description || "");
   const [editLinks, setEditLinks] = React.useState((item.links || []).map(l => l.href).join(", "));
+  const [isEditing, setIsEditing] = React.useState(false);
+  const [isDeleting, setIsDeleting] = React.useState(false);
+  
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsEditing(true);
+    
+    try {
+      const links = editLinks
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map((href, i) => ({ label: `Link ${i + 1}`, href }));
+
+      await onEdit({ ...item, title: editTitle, description: editDesc || undefined, links: links.length ? links : undefined });
+    } finally {
+      setIsEditing(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    setIsDeleting(true);
+    try {
+      await onDelete();
+    } finally {
+      setIsDeleting(false);
+    }
+  };
   
   return (
     <Dialog>
       <Card className={`shadow-sm rounded-lg hover:shadow-md hover:scale-[1.01] transition-all duration-200 ${
-        dragging ? "ring-2 ring-blue-400" : "ring-1 ring-black/5"
-      } ${isOverlay ? 'cursor-grabbing' : ''}`}>
-        <div className="flex flex-col p-0">
+        dragging ? "ring-2 ring-blue-400 shadow-xl" : "ring-1 ring-black/5"
+      } ${isOverlay ? 'cursor-grabbing' : 'cursor-grab'}`}>
+        <div 
+          className="flex flex-col p-0"
+          {...(!isOverlay && dragHandleProps ? {
+            ...dragHandleProps.attributes,
+            ...(dragHandleProps.listeners as React.DOMAttributes<HTMLDivElement>)
+          } : {})}
+        >
           <CardHeader className="px-3 py-2">
             <div className="flex items-start justify-between gap-2">
               <CardTitle className="text-[16px] leading-tight font-semibold text-neutral-800 flex-1">{item.title}</CardTitle>
-              {!isOverlay && dragHandleProps && (
-                <div
-                  {...dragHandleProps.attributes}
-                  {...(dragHandleProps.listeners as React.DOMAttributes<HTMLDivElement>)}
-                  className="p-1 hover:bg-neutral-100 rounded cursor-grab active:cursor-grabbing transition-colors"
-                >
-                  <GripVertical className="size-3.5 text-neutral-400" />
+              {!isOverlay && (
+                <div className="p-1 rounded transition-colors">
+                  <GripVertical className="size-3.5 text-neutral-300" />
                 </div>
               )}
             </div>
@@ -539,12 +857,35 @@ function KanbanCard({
             <div className="flex w-full">
               <div className="ml-auto flex gap-1.5">
                 <DialogTrigger asChild>
-                  <Button size="iconXs" variant="outline" aria-label="Edit" className="hover:bg-neutral-100 h-7 w-7" onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}>
+                  <Button 
+                    size="iconXs" 
+                    variant="outline" 
+                    aria-label="Edit" 
+                    className="hover:bg-neutral-100 h-7 w-7" 
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onTouchStart={(e) => e.stopPropagation()}
+                  >
                     <Pencil className="size-3" />
                   </Button>
                 </DialogTrigger>
-                <Button size="iconXs" variant="destructive" aria-label="Delete" className="hover:bg-red-100 h-7 w-7" onClick={(e) => { e.preventDefault(); e.stopPropagation(); onDelete(); }}>
-                  <Trash2 className="size-3" />
+                <Button 
+                  size="iconXs" 
+                  variant="destructive" 
+                  aria-label="Delete" 
+                  className="hover:bg-red-100 h-7 w-7" 
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleDelete(); }}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onTouchStart={(e) => e.stopPropagation()}
+                  disabled={isDeleting}
+                >
+                  {isDeleting ? (
+                    <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-red-600"></div>
+                  ) : (
+                    <Trash2 className="size-3" />
+                  )}
                 </Button>
               </div>
             </div>
@@ -559,15 +900,7 @@ function KanbanCard({
           )}
         </DialogHeader>
         <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            const links = editLinks
-              .split(',')
-              .map(s => s.trim())
-              .filter(Boolean)
-              .map((href, i) => ({ label: `Link ${i + 1}`, href }));
-            onEdit({ ...item, title: editTitle, description: editDesc || undefined, links: links.length ? links : undefined });
-          }}
+          onSubmit={handleSave}
           className="space-y-3"
         >
           <div>
@@ -586,7 +919,19 @@ function KanbanCard({
             <DialogClose asChild>
               <Button type="button" variant="ghost">Close</Button>
             </DialogClose>
-            <Button type="submit">Save</Button>
+            <Button 
+              type="submit" 
+              disabled={isEditing}
+            >
+              {isEditing ? (
+                <>
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                  Saving...
+                </>
+              ) : (
+                'Save'
+              )}
+            </Button>
           </DialogFooter>
         </form>
       </DialogContent>
