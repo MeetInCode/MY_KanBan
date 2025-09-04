@@ -80,8 +80,10 @@ export default function KanbanBoard() {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] = React.useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [isSaving, setIsSaving] = React.useState(false);
+  const [saveSuccess, setSaveSuccess] = React.useState(false);
   const loadingRef = React.useRef(false);
-  const localUpdateRef = React.useRef<Set<string>>(new Set());
+  const pendingUpdatesRef = React.useRef<Map<string, NodeJS.Timeout>>(new Map());
 
   // Helper function to ensure no duplicate items across columns
   const ensureUniqueItems = React.useCallback((boardState: BoardState): BoardState => {
@@ -106,37 +108,40 @@ export default function KanbanBoard() {
     if (loadingRef.current) return;
     loadingRef.current = true;
     
+    // Capture ref values for cleanup
+    const pendingUpdates = pendingUpdatesRef.current;
+    
     const fetchData = async () => {
       try {
         setError(null);
-        const { data: columns } = await supabase
-          .from("kanban_columns")
-          .select("key, title, position")
-          .order("position", { ascending: true });
+      const { data: columns } = await supabase
+        .from("kanban_columns")
+        .select("key, title, position")
+        .order("position", { ascending: true });
 
-        const { data: cards } = await supabase
-          .from("kanban_cards")
-          .select("id, title, description, links, column_key, position")
-          .order("position", { ascending: true });
+      const { data: cards } = await supabase
+        .from("kanban_cards")
+        .select("id, title, description, links, column_key, position")
+        .order("position", { ascending: true });
 
-        const next: BoardState = { todo: [], doing: [], done: [], temp: [] };
-        for (const col of columns || []) {
-          const colKey = col.key as ColumnKey;
-          next[colKey] = [];
-        }
-        for (const c of cards || []) {
-          const colKey = (c.column_key as ColumnKey) ?? "todo";
-          const links = Array.isArray(c.links)
-            ? (c.links as { label?: string; href: string }[]).map((l, i) => ({
-                label: l.label ?? `Link ${i + 1}`,
-                href: l.href,
-              }))
-            : undefined;
-          next[colKey] = [
-            ...next[colKey],
-            { id: String(c.id), title: c.title, description: c.description ?? undefined, links },
-          ];
-        }
+      const next: BoardState = { todo: [], doing: [], done: [], temp: [] };
+      for (const col of columns || []) {
+        const colKey = col.key as ColumnKey;
+        next[colKey] = [];
+      }
+      for (const c of cards || []) {
+        const colKey = (c.column_key as ColumnKey) ?? "todo";
+        const links = Array.isArray(c.links)
+          ? (c.links as { label?: string; href: string }[]).map((l, i) => ({
+              label: l.label ?? `Link ${i + 1}`,
+              href: l.href,
+            }))
+          : undefined;
+        next[colKey] = [
+          ...next[colKey],
+          { id: String(c.id), title: c.title, description: c.description ?? undefined, links },
+        ];
+      }
         setBoard(ensureUniqueItems(next));
         setLoading(false);
       } catch (error) {
@@ -148,99 +153,70 @@ export default function KanbanBoard() {
 
     fetchData();
 
-    // Set up real-time subscription for kanban_cards table
+    // Set up real-time subscription only for INSERT and DELETE events
+    // No real-time updates for column changes to prevent glitching
     const subscription = supabase
       .channel('kanban_cards_changes')
       .on(
         'postgres_changes',
         {
-          event: '*',
+          event: 'INSERT',
           schema: 'public',
           table: 'kanban_cards'
         },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (payload: any) => {
-          console.log('Real-time update received:', payload);
-          
-          switch (payload.eventType) {
-            case 'INSERT':
-              console.log('INSERT event:', payload.new);
-              if (payload.new) {
-                const newCard = payload.new;
-                const colKey = (newCard.column_key as ColumnKey) ?? "todo";
-                const links = Array.isArray(newCard.links)
-                  ? (newCard.links as { label?: string; href: string }[]).map((l, i) => ({
-                      label: l.label ?? `Link ${i + 1}`,
-                      href: l.href,
-                    }))
-                  : undefined;
-                const newItem: KanbanItem = {
-                  id: String(newCard.id),
-                  title: newCard.title,
-                  description: newCard.description ?? undefined,
-                  links,
-                };
-                setBoard(prev => ensureUniqueItems({
-                  ...prev,
-                  [colKey]: [newItem, ...prev[colKey]]
-                }));
+          console.log('Real-time INSERT event:', payload);
+          if (payload.new) {
+            const newCard = payload.new;
+            const colKey = (newCard.column_key as ColumnKey) ?? "todo";
+            const links = Array.isArray(newCard.links)
+              ? (newCard.links as { label?: string; href: string }[]).map((l, i) => ({
+                  label: l.label ?? `Link ${i + 1}`,
+                  href: l.href,
+                }))
+              : undefined;
+            const newItem: KanbanItem = {
+              id: String(newCard.id),
+              title: newCard.title,
+              description: newCard.description ?? undefined,
+              links,
+            };
+            setBoard(prev => ensureUniqueItems({
+              ...prev,
+              [colKey]: [newItem, ...prev[colKey]]
+            }));
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'DELETE',
+          schema: 'public',
+          table: 'kanban_cards'
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (payload: any) => {
+          console.log('Real-time DELETE event:', payload);
+          if (payload.old) {
+            const deletedCard = payload.old;
+            const cardId = String(deletedCard.id);
+            
+            // Clear any pending timeout for this card
+            const existingTimeout = pendingUpdatesRef.current.get(cardId);
+            if (existingTimeout) {
+              clearTimeout(existingTimeout);
+              pendingUpdatesRef.current.delete(cardId);
+            }
+            
+            setBoard(prev => {
+              const newBoard = { ...prev };
+              for (const colKey of Object.keys(newBoard) as ColumnKey[]) {
+                newBoard[colKey] = newBoard[colKey].filter(item => item.id !== cardId);
               }
-              break;
-            case 'UPDATE':
-              console.log('UPDATE event:', payload.new);
-              if (payload.new) {
-                const updatedCard = payload.new;
-                const cardId = String(updatedCard.id);
-                
-                // Skip real-time updates for items we're currently updating locally
-                if (localUpdateRef.current.has(cardId)) {
-                  console.log(`Skipping real-time update for ${cardId} - local update in progress`);
-                  return;
-                }
-                
-                const newColKey = (updatedCard.column_key as ColumnKey) ?? "todo";
-                const links = Array.isArray(updatedCard.links)
-                  ? (updatedCard.links as { label?: string; href: string }[]).map((l, i) => ({
-                      label: l.label ?? `Link ${i + 1}`,
-                      href: l.href,
-                    }))
-                  : undefined;
-                const updatedItem: KanbanItem = {
-                  id: cardId,
-                  title: updatedCard.title,
-                  description: updatedCard.description ?? undefined,
-                  links,
-                };
-                setBoard(prev => {
-                  const newBoard = { ...prev };
-                  
-                  // Remove the item from all columns first
-                  for (const colKey of Object.keys(newBoard) as ColumnKey[]) {
-                    newBoard[colKey] = newBoard[colKey].filter(item => item.id !== cardId);
-                  }
-                  
-                  // Add the updated item to the correct column
-                  newBoard[newColKey] = [...newBoard[newColKey], updatedItem];
-                  
-                  return ensureUniqueItems(newBoard);
-                });
-              }
-              break;
-            case 'DELETE':
-              console.log('DELETE event:', payload.old);
-              if (payload.old) {
-                const deletedCard = payload.old;
-                setBoard(prev => {
-                  const newBoard = { ...prev };
-                  for (const colKey of Object.keys(newBoard) as ColumnKey[]) {
-                    newBoard[colKey] = newBoard[colKey].filter(item => item.id !== String(deletedCard.id));
-                  }
-                  return ensureUniqueItems(newBoard);
-                });
-              }
-              break;
-            default:
-              console.log('Unknown event type:', payload.eventType);
+              return ensureUniqueItems(newBoard);
+            });
           }
         }
       )
@@ -253,9 +229,14 @@ export default function KanbanBoard() {
         }
       });
 
-    // Cleanup subscription on unmount
+    // Cleanup subscription and timeouts on unmount
     return () => {
       subscription.unsubscribe();
+      // Clear all pending timeouts
+      pendingUpdates.forEach((timeout) => {
+        clearTimeout(timeout);
+      });
+      pendingUpdates.clear();
     };
   }, [ensureUniqueItems]);
 
@@ -355,10 +336,17 @@ export default function KanbanBoard() {
         void persistColumnPositions(overContainer);
       }
     } else {
-      // Moved across columns - update immediately for better UX
+      // Moved across columns - update locally only, no database persistence
       const activeItem = board[activeContainer].find(item => item.id === activeId);
       if (activeItem) {
-        // Update local state immediately
+        // Cancel any existing pending update for this card
+        const existingTimeout = pendingUpdatesRef.current.get(activeId);
+        if (existingTimeout) {
+          clearTimeout(existingTimeout);
+          pendingUpdatesRef.current.delete(activeId);
+        }
+        
+        // Update local state immediately - no database persistence for column changes
         setBoard((prev) => {
           const newBoard = { ...prev };
           // Remove from source column
@@ -368,8 +356,7 @@ export default function KanbanBoard() {
           return ensureUniqueItems(newBoard);
         });
         
-        // Update Supabase in background
-        void updateCardColumnAndPositions(activeId, overContainer, activeContainer);
+        console.log(`Card ${activeId} moved from ${activeContainer} to ${overContainer} - local only`);
       }
     }
     
@@ -435,6 +422,13 @@ export default function KanbanBoard() {
     try {
       setError(null);
       console.log("Deleting card with id:", id);
+      
+      // Clear any pending timeout for this card
+      const existingTimeout = pendingUpdatesRef.current.get(id);
+      if (existingTimeout) {
+        clearTimeout(existingTimeout);
+        pendingUpdatesRef.current.delete(id);
+      }
       
       const { error } = await supabase
         .from("kanban_cards")
@@ -509,11 +503,11 @@ export default function KanbanBoard() {
 
   async function persistColumnPositions(col: ColumnKey) {
     try {
-      const items = board[col];
+    const items = board[col];
       if (items.length === 0) return;
       
-      // Re-read latest to avoid stale closure
-      const current = items.map((it, idx) => ({ id: it.id, position: idx }));
+    // Re-read latest to avoid stale closure
+    const current = items.map((it, idx) => ({ id: it.id, position: idx }));
       
       // Update all positions in parallel for better performance
       const updatePromises = current.map(row => 
@@ -527,48 +521,59 @@ export default function KanbanBoard() {
     }
   }
 
-
-  async function updateCardColumnAndPositions(cardId: string, newCol: ColumnKey, oldCol: ColumnKey) {
+  async function saveAllPositions() {
     try {
-      console.log(`Moving card ${cardId} from ${oldCol} to ${newCol}`);
+      setIsSaving(true);
+      setError(null);
+      console.log("Saving all card positions to database...");
       
-      // Mark this card as being updated locally to prevent real-time conflicts
-      localUpdateRef.current.add(cardId);
+      // Get all cards with their current positions and columns
+      const allUpdates: Array<{ id: string; column_key: ColumnKey; position: number }> = [];
       
-      // Update the card's column
-      const { error: columnError } = await supabase
-        .from("kanban_cards")
-        .update({ 
-          column_key: newCol,
-          updated_at: new Date().toISOString()
-        })
-        .eq("id", cardId);
-
-      if (columnError) {
-        console.error("Error updating card column:", columnError);
-        setError(`Failed to move task: ${columnError.message}`);
-        localUpdateRef.current.delete(cardId);
+      for (const [colKey, items] of Object.entries(board) as [ColumnKey, KanbanItem[]][]) {
+        items.forEach((item, index) => {
+          allUpdates.push({
+            id: item.id,
+            column_key: colKey,
+            position: index
+          });
+        });
+      }
+      
+      if (allUpdates.length === 0) {
+        console.log("No cards to save");
+        setIsSaving(false);
         return;
       }
-
-      // Update positions for both columns in parallel
-      await Promise.all([
-        persistColumnPositions(newCol),
-        persistColumnPositions(oldCol),
-      ]);
-
-      console.log(`Successfully moved card ${cardId} from ${oldCol} to ${newCol}`);
       
-      // Remove from local update tracking after a short delay
-      setTimeout(() => {
-        localUpdateRef.current.delete(cardId);
-      }, 1000);
+      // Update all cards in parallel
+      const updatePromises = allUpdates.map(update => 
+        supabase
+          .from("kanban_cards")
+          .update({ 
+            column_key: update.column_key,
+            position: update.position,
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", update.id)
+      );
+      
+      await Promise.all(updatePromises);
+      console.log(`Successfully saved positions for ${allUpdates.length} cards`);
+      
+      // Show success message
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 3000);
+      
     } catch (error) {
-      console.error("Error updating card column and positions:", error);
-      setError("Failed to move task. Please check your connection.");
-      localUpdateRef.current.delete(cardId);
+      console.error("Error saving all positions:", error);
+      setError("Failed to save positions. Please try again.");
+    } finally {
+      setIsSaving(false);
     }
   }
+
+
 
   if (loading) {
     return (
@@ -611,14 +616,22 @@ export default function KanbanBoard() {
               </button>
             </div>
           )}
+          {saveSuccess && (
+            <div className="mt-2 p-2 bg-green-900/20 border border-green-500/30 rounded-md">
+              <p className="text-green-300 text-xs">✅ Positions saved successfully!</p>
+            </div>
+          )}
         </div>
-        <Dialog open={addOpen} onOpenChange={setAddOpen}>
-          <DialogTrigger asChild>
-            <Button variant="secondary" className="h-10 px-6">
-              <span className="mr-2">+</span>
-              Add Task
-            </Button>
-          </DialogTrigger>
+        <div className="flex gap-3">
+         
+          <Dialog open={addOpen} onOpenChange={setAddOpen}>
+            <DialogTrigger asChild>
+              <Button variant="secondary" className="h-10 px-6">
+                <span className="mr-2">+</span>
+                Add Task
+              </Button>
+              
+            </DialogTrigger>
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Add task</DialogTitle>
@@ -655,6 +668,24 @@ export default function KanbanBoard() {
             </form>
           </DialogContent>
         </Dialog>
+        <Button 
+            onClick={saveAllPositions}
+            disabled={isSaving}
+            variant="outline" 
+            className="h-10 px-6"
+          >
+            {isSaving ? (
+              <>
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-current mr-2"></div>
+                Saving...
+              </>
+            ) : (
+              <>
+                Save 
+              </>
+            )}
+          </Button>
+        </div>
       </div>
       
       <DndContext
@@ -884,7 +915,7 @@ function KanbanCard({
                   {isDeleting ? (
                     <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-red-600"></div>
                   ) : (
-                    <Trash2 className="size-3" />
+                  <Trash2 className="size-3" />
                   )}
                 </Button>
               </div>
