@@ -1,10 +1,22 @@
+"use client";
+
 import React from 'react';
 import Prism from '../components/Prism/Prism';
 import { SpinningText } from "@/components/magicui/spinning-text";
 import { AuroraText } from "@/components/magicui/aurora-text";
 import KanbanBoard from "@/components/KanbanBoard";
+import MobileTodoList from "@/components/MobileTodoList";
+import { useMobile } from "@/hooks/useMobile";
 
 const Page = () => {
+  const isMobile = useMobile();
+
+  // Mobile view - simple white background with todo list
+  if (isMobile) {
+    return <MobileTodoList />;
+  }
+
+  // Desktop view - original design
   return (
     <div style={{ position: 'relative', width: '100vw', minHeight: '100vh', overflow: 'hidden' }}>
       {/* Background Prism Animation */}
