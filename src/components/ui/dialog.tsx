@@ -38,7 +38,7 @@ export function DialogTrigger({ asChild, children }: { asChild?: boolean; childr
       child.props.onClick?.(e);
       ctx.setOpen(true);
     },
-  } as any;
+  } as React.HTMLAttributes<HTMLElement>;
   return asChild ? React.cloneElement(child, props) : <button {...props}>{children}</button>;
 }
 
@@ -83,7 +83,7 @@ export function DialogClose({ asChild, children }: { asChild?: boolean; children
       child.props.onClick?.(e);
       ctx.setOpen(false);
     },
-  } as any;
+  } as React.HTMLAttributes<HTMLElement>;
   return asChild ? React.cloneElement(child, props) : <button {...props}>{children}</button>;
 }
 
